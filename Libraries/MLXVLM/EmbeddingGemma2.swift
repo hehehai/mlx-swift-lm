@@ -38,9 +38,9 @@ package struct EmbeddingGemma2ImageProcessor: Sendable {
 
     /// - Returns: `[1, 3, H, W]` pixels in `0...1` resized to the soft-token budget,
     ///   and their soft-token count.
-    package func pixels(for image: UserInput.Image) throws -> (pixels: MLXArray, tokens: Int) {
+    package func pixels(for image: UserInput.Image, budget: Int? = nil) throws -> (pixels: MLXArray, tokens: Int) {
         let image = try Self.prepared(image.asCIImage())
-        let target = configuration.aspectPreservingTargetSize(for: image.extent.size)
+        let target = configuration.aspectPreservingTargetSize(for: image.extent.size, budget: budget)
         let (height, width) = (Int(target.height), Int(target.width))
         return (
             Self.pixels(image, height: height, width: width),
@@ -597,13 +597,13 @@ public actor EmbeddingGemma2Embedding {
     /// Embeds independent items in input order, one at a time to bound working memory.
     /// Retrieval uses `.searchQuery` for queries and `.document` for corpus items.
     public func embed(
-        _ inputs: [Input], task: Task, dimensions: Int? = nil
+        _ inputs: [Input], task: Task, dimensions: Int? = nil, imageBudget: Int? = nil
     ) async throws -> [[Float]] {
         var vectors: [[Float]] = []
         vectors.reserveCapacity(inputs.count)
         for input in inputs {
             try Swift.Task.checkCancellation()
-            vectors.append(try await embed(input, task: task, dimensions: dimensions))
+            vectors.append(try await embed(input, task: task, dimensions: dimensions, imageBudget: imageBudget))
         }
         return vectors
     }
@@ -613,7 +613,7 @@ public actor EmbeddingGemma2Embedding {
     /// Each media item's soft tokens are evaluated before the next one is prepared, so
     /// only one encoder's activations are alive at a time.
     public func embed(
-        _ input: Input, task: Task, dimensions: Int? = nil
+        _ input: Input, task: Task, dimensions: Int? = nil, imageBudget: Int? = nil
     ) async throws -> [Float] {
         try Swift.Task.checkCancellation()
         let dimension = dimensions ?? model.config.embeddingDim
@@ -651,7 +651,7 @@ public actor EmbeddingGemma2Embedding {
                 segments.append(.text(tokenizer.encode(text: text, addSpecialTokens: false)))
                 text = ""
             }
-            let (segment, features) = try await encode(part)
+            let (segment, features) = try await encode(part, imageBudget: imageBudget)
             if let features {
                 try MLX.checkedEval(features)
                 softTokens.append(features.reshaped(-1, features.dim(-1)))
@@ -682,7 +682,7 @@ public actor EmbeddingGemma2Embedding {
     }
 
     /// The segment of one media part and the soft tokens that fill it, `nil` when empty.
-    private func encode(_ part: Input.Part) async throws -> (
+    private func encode(_ part: Input.Part, imageBudget: Int? = nil) async throws -> (
         EmbeddingGemma2Sequence.Segment, MLXArray?
     ) {
         switch part {
@@ -692,7 +692,7 @@ public actor EmbeddingGemma2Embedding {
             let processor =
                 try imageProcessor ?? EmbeddingGemma2ImageProcessor(directory: modelDirectory)
             imageProcessor = processor
-            let pixels = try processor.pixels(for: image).pixels
+            let pixels = try processor.pixels(for: image, budget: imageBudget).pixels
             try MLX.checkedEval(pixels)
             try Swift.Task.checkCancellation()
             try await model.loadMediaComponents([.vision])
