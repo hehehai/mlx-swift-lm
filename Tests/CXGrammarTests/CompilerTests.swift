@@ -80,6 +80,15 @@ struct CompilerTests {
         #expect(compiled != nil, "xg_compile_json_schema produced a null handle on success")
         xg_compiled_grammar_free(compiled)
 
+        // Compact JSON (any_whitespace off) compiles the same schema too.
+        var compact: OpaquePointer?
+        let compactStatus: XGStatus = schema.withCString { schemaPtr in
+            xg_compile_json_schema_ex(compiler, schemaPtr, 0, &compact)
+        }
+        #expect(compactStatus == XG_OK, "xg_compile_json_schema_ex returned \(compactStatus)")
+        #expect(compact != nil, "xg_compile_json_schema_ex produced a null handle on success")
+        xg_compiled_grammar_free(compact)
+
         _ = cStrings.count
     }
 
