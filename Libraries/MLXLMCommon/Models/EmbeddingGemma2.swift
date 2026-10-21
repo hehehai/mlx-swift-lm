@@ -292,6 +292,11 @@ public struct EmbeddingGemma2Configuration: Codable, Sendable {
 /// the checkpoint files readable until then.
 public final class EmbeddingGemma2: Module, BaseLanguageModel, ModelComponentsProviding {
 
+    /// What float16 weights and activations become (the model card forbids float16:
+    /// activations exceed its range). bfloat16 has float32's range at half the work;
+    /// set it before loading.
+    nonisolated(unsafe) public static var computeType: DType = .float32
+
     public let config: EmbeddingGemma2Configuration
 
     @ModuleInfo(key: "language_model") private var languageModel: EmbeddingGemma2TextModel
@@ -424,7 +429,7 @@ public final class EmbeddingGemma2: Module, BaseLanguageModel, ModelComponentsPr
         }
         var hidden = languageModel.embedTokens(inputIds)
         // The model card forbids float16: activations exceed its range.
-        if hidden.dtype == .float16 { hidden = hidden.asType(.float32) }
+        if hidden.dtype == .float16 { hidden = hidden.asType(Self.computeType) }
         // Matches the reference: sqrt(hidden) is rounded to the weight dtype (22.625 in bf16).
         hidden = hidden * MLXArray(Float(config.hiddenSize).squareRoot()).asType(hidden.dtype)
         if let softTokens, let first = softTokenIDs.first {
@@ -477,7 +482,7 @@ public final class EmbeddingGemma2: Module, BaseLanguageModel, ModelComponentsPr
                 let channelsLast = value.movedAxis(source: 1, destination: -1)
                 if channelsLast.shape == shape { tensor = channelsLast }
             }
-            checkpoint.weights[key] = tensor.dtype == .float16 ? tensor.asType(.float32) : tensor
+            checkpoint.weights[key] = tensor.dtype == .float16 ? tensor.asType(Self.computeType) : tensor
         }
         return checkpoint
     }
