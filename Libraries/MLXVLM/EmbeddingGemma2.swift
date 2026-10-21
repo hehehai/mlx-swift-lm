@@ -608,6 +608,90 @@ public actor EmbeddingGemma2Embedding {
         return vectors
     }
 
+    /// One text to embed in a batch, with its document title.
+    public struct TextItem: Sendable {
+        public let text: String
+        public let title: String?
+        public init(text: String, title: String? = nil) {
+            self.text = text
+            self.title = title
+        }
+    }
+
+    /// Embeds texts together: sorted by length, packed into batches of at most
+    /// `maxBatch` items and `batchTokens` padded tokens, one forward pass each with a
+    /// padding mask (attention and pooling ignore the padding). The vectors are those
+    /// `embed(_:task:dimensions:)` gives one at a time, within float rounding. An item
+    /// that cannot be embedded (empty) gets its error; the others go on.
+    public func embedTexts(
+        _ items: [TextItem], task: Task, dimensions: Int? = nil,
+        batchTokens: Int = 8192, maxBatch: Int = 32
+    ) async throws -> [Result<[Float], Swift.Error>] {
+        let dimension = dimensions ?? model.config.embeddingDim
+        guard
+            dimension == model.config.embeddingDim
+                || ([128, 256, 512].contains(dimension) && dimension <= model.config.embeddingDim)
+        else { throw Error.invalidDimension }
+        guard let begin = tokenizer.bosToken.flatMap({ tokenizer.convertTokenToId($0) }),
+            let end = tokenizer.eosTokenId ?? tokenizer.convertTokenToId("<eos>")
+        else { throw Error.invalidEmbedding }
+        var out = [Result<[Float], Swift.Error>](repeating: .failure(Error.emptyInput), count: items.count)
+        var sequences: [(index: Int, tokens: [Int])] = []
+        for (i, item) in items.enumerated() {
+            if item.text.allSatisfy(\.isWhitespace) { continue }  // emptyInput
+            let prompted = Self.prompt(text: item.text, title: item.title, task: task)
+            do {
+                let tokens = try EmbeddingGemma2Sequence.tokens(
+                    [.text(tokenizer.encode(text: prompted, addSpecialTokens: false))],
+                    configuration: model.config, beginOfSequence: begin, endOfSequence: end,
+                    limit: EmbeddingGemma2Configuration.contextLength)
+                sequences.append((i, tokens))
+            } catch {
+                out[i] = .failure(error)
+            }
+        }
+        sequences.sort { $0.tokens.count < $1.tokens.count }
+        var start = 0
+        while start < sequences.count {
+            try Swift.Task.checkCancellation()
+            // Longest last: a batch's padded size is its count times its last length.
+            var stop = start + 1
+            while stop < sequences.count, stop - start < maxBatch,
+                (stop - start + 1) * sequences[stop].tokens.count <= batchTokens
+            {
+                stop += 1
+            }
+            let batch = sequences[start ..< stop]
+            let length = batch.last!.tokens.count
+            var ids = [Int32](repeating: Int32(end), count: batch.count * length)
+            var mask = [Int32](repeating: 0, count: batch.count * length)
+            for (row, s) in batch.enumerated() {
+                for (col, t) in s.tokens.enumerated() {
+                    ids[row * length + col] = Int32(t)
+                    mask[row * length + col] = 1
+                }
+            }
+            let vectors = model.embed(
+                inputIds: MLXArray(ids, [batch.count, length]),
+                attentionMask: MLXArray(mask, [batch.count, length]))
+            try MLX.checkedEval(vectors)
+            let values = vectors.asArray(Float.self)
+            let width = vectors.dim(1)
+            for (row, s) in batch.enumerated() {
+                let all = values[(row * width) ..< ((row + 1) * width)]
+                let truncated = Array(all.prefix(dimension))
+                let norm = truncated.reduce(0.0) { $0 + Double($1) * Double($1) }.squareRoot()
+                guard all.allSatisfy(\.isFinite), norm.isFinite, norm > 0 else {
+                    out[s.index] = .failure(Error.invalidEmbedding)
+                    continue
+                }
+                out[s.index] = .success(truncated.map { Float(Double($0) / norm) })
+            }
+            start = stop
+        }
+        return out
+    }
+
     /// Embeds one item; returns a unit-length float32 vector.
     ///
     /// Each media item's soft tokens are evaluated before the next one is prepared, so
